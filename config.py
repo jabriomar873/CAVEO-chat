@@ -1,0 +1,172 @@
+# Configuration for Enhanced PDF Chat Accuracy
+
+# Retrieval Configuration
+RETRIEVAL_CONFIG = {
+    # Number of documents to retrieve initially
+    "initial_k": 10,
+    
+    # Number of documents to consider in MMR
+    "fetch_k": 20,
+    
+    # Lambda parameter for MMR (balance between relevance and diversity)
+    "lambda_mult": 0.6,
+    
+    # Number of documents for extended search when answer seems incomplete
+    "extended_k": 15,
+    
+    # Search type: "similarity", "mmr", or "similarity_score_threshold"
+    "search_type": "mmr"
+}
+
+# Text Processing Configuration
+TEXT_CONFIG = {
+    # Chunk size for text splitting
+    "chunk_size": 800,
+    
+    # Overlap between chunks
+    "chunk_overlap": 300,
+    
+    # Text separators for better splitting
+    "separators": ["\n\n", "\n", ".", "!", "?", ";", ":", " ", ""]
+}
+
+# TF-IDF Configuration
+TFIDF_CONFIG = {
+    # Maximum number of features
+    "max_features": 1024,
+    
+    # N-gram range
+    "ngram_range": (1, 3),
+    
+    # Minimum document frequency
+    "min_df": 1,
+    
+    # Maximum document frequency
+    "max_df": 0.85,
+    
+    # Use sublinear term frequency
+    "sublinear_tf": True,
+    
+    # Stop words
+    "stop_words": "english"
+}
+
+# LLM Configuration
+LLM_CONFIG = {
+    # Temperature for response generation
+    "temperature": 0.2,
+    
+    # Top-p for nucleus sampling
+    "top_p": 0.9,
+    
+    # Top-k for top-k sampling
+    "top_k": 40
+}
+
+# Query Enhancement Keywords
+QUERY_ENHANCEMENT = {
+    "phase_keywords": ["phase", "étape", "step", "stage", "niveau"],
+    "process_keywords": ["processus", "process", "procédure", "workflow"],
+    "project_keywords": ["projet", "project", "développement", "development"],
+    "completeness_keywords": ["combien", "how many", "toutes", "all", "liste", "complete"]
+}
+
+# Response Validation
+VALIDATION_CONFIG = {
+    # Minimum number of phases expected in complete answers
+    "min_phases_expected": 2,
+    
+    # Keywords that indicate the user wants complete information
+    "completeness_indicators": ["combien", "toutes", "liste", "how many", "all", "complete", "entier"],
+    
+    # Keywords that boost document relevance scores
+    "relevance_boosters": {
+        "phase_mentions": 10,
+        "numbered_lists": 5,
+        "structure_indicators": 3,
+        "completeness_bonus": 15
+    }
+}
+
+# Prompt Templates
+PROMPT_TEMPLATES = {
+    "main_template": """Tu es un assistant expert en analyse de documents techniques. Tu dois répondre aux questions en te basant sur les documents fournis.
+
+INSTRUCTIONS:
+1. Si la question porte sur des éléments spécifiques des documents (phases, processus, etc.), analyse le contenu en détail
+2. Si c'est une question générale, donne une réponse appropriée et propose d'analyser les documents si nécessaire
+3. Sois précis et utilise les informations exactes des documents
+4. Si des informations semblent manquer, indique-le clairement
+
+CONTEXTE DES DOCUMENTS:
+{context}
+
+QUESTION: {question}
+
+RÉPONSE:""",
+
+    "phase_counting_template": """Tu es un assistant expert qui doit compter avec PRÉCISION toutes les phases dans les documents.
+
+INSTRUCTION ABSOLUE: 
+- Examine TOUT le contexte fourni
+- Compte UNIQUEMENT les phases qui existent réellement dans les documents
+- N'invente JAMAIS de phases qui n'existent pas
+- Inclus OBLIGATOIREMENT la Phase 00 si elle existe
+
+MÉTHODE STRICTE:
+1. Scan tout le texte pour "Phase" suivi d'un numéro (00, 01, 02, 03, etc.)
+2. Identifie les descriptions de chaque phase
+3. Compte le nombre total EXACT
+4. Liste chaque phase avec sa description exacte
+
+INTERDICTIONS:
+- N'invente pas de phases inexistantes (Phase 04, 05, etc.)
+- Ne spécule pas sur des phases possibles
+- Ne compte que les phases explicitement mentionnées
+
+CONTEXTE DES DOCUMENTS:
+{context}
+
+QUESTION: {question}
+
+RÉPONSE PRÉCISE (compte exact basé sur les documents):
+Voici le nombre EXACT et la liste COMPLÈTE des phases trouvées dans les documents:""",
+
+    "document_analysis_template": """Tu es un assistant expert en analyse de documents techniques. Tu dois répondre aux questions en te basant UNIQUEMENT sur les documents fournis.
+
+INSTRUCTIONS IMPORTANTES:
+1. Lis attentivement TOUT le contexte fourni
+2. Identifie TOUTES les phases, étapes ou sections mentionnées
+3. Si une question porte sur les phases d'un projet, liste-les TOUTES sans exception
+4. Sois précis et complet dans tes réponses
+5. Si des informations semblent manquer, indique-le clairement
+6. Utilise les numéros et noms exacts des phases/sections trouvés dans les documents
+
+CONTEXTE DES DOCUMENTS:
+{context}
+
+QUESTION: {question}
+
+RÉPONSE DÉTAILLÉE:
+Basé sur l'analyse complète des documents fournis:""",
+
+    "completeness_template": """Tu es un assistant expert qui doit donner une réponse COMPLÈTE et EXHAUSTIVE.
+
+INSTRUCTION SPÉCIALE: Cette question demande une réponse complète. Tu DOIS inclure TOUTES les phases, étapes ou éléments mentionnés dans les documents.
+
+CONTEXTE DES DOCUMENTS:
+{context}
+
+QUESTION: {question}
+
+RÉPONSE COMPLÈTE ET EXHAUSTIVE:
+Voici la liste COMPLÈTE basée sur les documents:"""
+}
+
+# Error Messages
+ERROR_MESSAGES = {
+    "incomplete_response": "La réponse semble incomplète. Vérifiez si toutes les phases sont mentionnées.",
+    "no_context": "Aucun contexte pertinent trouvé dans les documents.",
+    "retrieval_error": "Erreur lors de la récupération des informations.",
+    "llm_error": "Erreur lors de la génération de la réponse."
+}
