@@ -24,13 +24,28 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain_ollama import OllamaLLM
 from langchain.prompts import PromptTemplate
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from typing import List, Any
+from pydantic import PrivateAttr, ConfigDict, Field
 from htmlTemplates import css, bot_template, user_template
-from enhanced_retrieval import enhance_query, rerank_retrieved_docs, create_enhanced_context, validate_response_completeness
-from config import RETRIEVAL_CONFIG, TEXT_CONFIG, TFIDF_CONFIG, LLM_CONFIG, PROMPT_TEMPLATES
+from enhanced_retrieval import (
+    enhance_query,
+    rerank_retrieved_docs,
+    create_enhanced_context,
+    validate_response_completeness,
+    extract_phases_from_docs,
+    extract_subject_from_docs,
+    extract_actors_from_docs,
+    build_subject_index,
+)
+from config import RETRIEVAL_CONFIG, TEXT_CONFIG, TFIDF_CONFIG, FASTEMBED_CONFIG, RERANK_CONFIG, LLM_CONFIG, PROMPT_TEMPLATES, MEMORY_CONFIG, GUARDRAIL_CONFIG, PERSISTENCE_CONFIG
 from intent_detection import detect_intent, generate_greeting_response, generate_simple_chat_response, should_use_enhanced_retrieval
 import warnings
 import subprocess
 import re
+from datetime import datetime
 
 # Suppress common warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
@@ -43,22 +58,59 @@ import logging
 logging.getLogger("torch").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
+def build_global_phase_map() -> dict:
+    """Scan all processed chunks to deterministically extract phases with citations.
+
+    Caches result in st.session_state.phase_cache.
+    """
+    try:
+        if st.session_state.get('phase_cache'):
+            return st.session_state['phase_cache']
+        chunks = st.session_state.get('all_chunks') or []
+        if not chunks:
+            return {}
+        # Reuse extractor on all chunks
+        from enhanced_retrieval import extract_phases_from_docs
+        phase_map = extract_phases_from_docs(chunks)
+        st.session_state['phase_cache'] = phase_map
+        return phase_map
+    except Exception:
+        return {}
+
 def get_pdf_text(pdf_docs):
-    """Extract text from PDF documents with OCR support for scanned PDFs"""
-    text = ""
+    """Extract text and metadata from PDFs with OCR fallback for scanned pages.
+
+    Returns a list of LangChain Document objects with page metadata for better citations.
+    """
+    docs = []
+    # Keep lightweight PDF-level metadata for subject detection
+    if 'pdf_meta' not in st.session_state:
+        st.session_state.pdf_meta = {}
+
     for pdf in pdf_docs:
         try:
             pdf_reader = PdfReader(pdf)
-            pdf_text = ""
+            file_name = getattr(pdf, 'name', 'uploaded.pdf')
+            full_text_found = False
+            # Capture top-level PDF metadata
+            try:
+                raw_meta = pdf_reader.metadata or {}
+                st.session_state.pdf_meta[file_name] = {k: (str(v) if v is not None else '') for k, v in raw_meta.items()}
+            except Exception:
+                st.session_state.pdf_meta[file_name] = {}
             
             # First try normal text extraction
-            for page in pdf_reader.pages:
+            for page_index, page in enumerate(pdf_reader.pages):
                 page_text = page.extract_text()
-                if page_text:
-                    pdf_text += page_text
+                if page_text and page_text.strip():
+                    full_text_found = True
+                    docs.append(Document(
+                        page_content=page_text,
+                        metadata={"source": file_name, "page": page_index + 1}
+                    ))
             
             # If no text found, try OCR with PyMuPDF
-            if not pdf_text.strip():
+            if not full_text_found:
                 try:
                     import fitz  # PyMuPDF
                     import pytesseract
@@ -113,7 +165,7 @@ def get_pdf_text(pdf_docs):
                     pdf_bytes = pdf.read()
                     pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
                     
-                    st.info(f"🔍 Using OCR for {pdf.name} (scanned document)")
+                    st.info(f"🔍 Using OCR for {file_name} (scanned document)")
                     
                     for page_num in range(len(pdf_document)):
                         page = pdf_document[page_num]
@@ -126,7 +178,10 @@ def get_pdf_text(pdf_docs):
                         try:
                             ocr_text = pytesseract.image_to_string(image, lang='eng')
                             if ocr_text.strip():
-                                pdf_text += ocr_text + "\n"
+                                docs.append(Document(
+                                    page_content=ocr_text,
+                                    metadata={"source": file_name, "page": page_num + 1, "ocr": True}
+                                ))
                         except Exception as ocr_error:
                             st.warning(f"⚠️ OCR failed for page {page_num + 1}: {str(ocr_error)}")
                     
@@ -140,201 +195,275 @@ def get_pdf_text(pdf_docs):
                     st.error(f"❌ OCR failed for {pdf.name}: {str(e)}")
                     continue
             
-            if pdf_text.strip():
-                text += pdf_text
-                st.success(f"✅ Processed {pdf.name}")
+            if docs:
+                st.success(f"✅ Processed {file_name}")
             else:
-                st.error(f"❌ No text found in {pdf.name}")
+                st.error(f"❌ No text found in {file_name}")
                 
         except Exception as e:
-            st.error(f"❌ Error reading {pdf.name}: {str(e)}")
+            st.error(f"❌ Error reading {getattr(pdf, 'name', 'uploaded.pdf')}: {str(e)}")
     
-    return text
+    return docs
 
-def get_text_chunks(text):
-    """Split text into chunks with improved overlapping for better context retention"""
-    # Use configuration for optimal chunking
+def get_text_chunks(documents):
+    """Split LC Documents into chunks while preserving metadata."""
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=TEXT_CONFIG["chunk_size"],
         chunk_overlap=TEXT_CONFIG["chunk_overlap"],
         length_function=len,
         separators=TEXT_CONFIG["separators"]
     )
-    chunks = text_splitter.split_text(text)
-    
-    # Add metadata to chunks for better tracking
-    enhanced_chunks = []
-    for i, chunk in enumerate(chunks):
-        # Add chunk number and context markers
-        enhanced_chunk = f"[CHUNK {i+1}] {chunk}"
-        enhanced_chunks.append(enhanced_chunk)
-    
-    return enhanced_chunks
+    return text_splitter.split_documents(documents)
 
 def get_vectorstore(text_chunks):
-    """Create vector store from text chunks using torch-free TF-IDF embeddings"""
+    """Create vector store from text chunks using fast local embeddings (FastEmbed) with a TF-IDF fallback."""
     try:
-        # Use sklearn TF-IDF to completely avoid torch
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from langchain.embeddings.base import Embeddings
-        import numpy as np
-        
-        class TorchFreeTFIDFEmbeddings(Embeddings):
-            def __init__(self):
-                self.vectorizer = TfidfVectorizer(
-                    max_features=TFIDF_CONFIG["max_features"],
-                    stop_words=TFIDF_CONFIG["stop_words"],
-                    ngram_range=TFIDF_CONFIG["ngram_range"],
-                    min_df=TFIDF_CONFIG["min_df"],
-                    max_df=TFIDF_CONFIG["max_df"],
-                    sublinear_tf=TFIDF_CONFIG["sublinear_tf"],
-                    analyzer='word'
-                )
-                self.fitted = False
-                self.feature_dim = TFIDF_CONFIG["max_features"]
-                
-            def embed_documents(self, texts):
-                if not self.fitted:
-                    vectors = self.vectorizer.fit_transform(texts)
-                    self.fitted = True
-                else:
-                    vectors = self.vectorizer.transform(texts)
-                
-                # Convert sparse matrix to dense and then to list
-                dense_vectors = vectors.toarray()
-                # Pad or truncate to fixed dimension
-                result = []
-                for vector in dense_vectors:
-                    if len(vector) < self.feature_dim:
-                        padded = np.pad(vector, (0, self.feature_dim - len(vector)), 'constant')
-                    else:
-                        padded = vector[:self.feature_dim]
-                    result.append(padded.tolist())
-                return result
-                
-            def embed_query(self, text):
-                if not self.fitted:
-                    return [0.0] * self.feature_dim
-                    
-                vector = self.vectorizer.transform([text])
-                dense_vector = vector.toarray()[0]
-                
-                # Pad or truncate to fixed dimension
-                if len(dense_vector) < self.feature_dim:
-                    padded = np.pad(dense_vector, (0, self.feature_dim - len(dense_vector)), 'constant')
-                else:
-                    padded = dense_vector[:self.feature_dim]
-                    
-                return padded.tolist()
-        
-        st.info("🔧 Using Enhanced TF-IDF embeddings (100% torch-free)")
-        embeddings = TorchFreeTFIDFEmbeddings()
-        
-        # Create vectorstore with enhanced retrieval settings
-        vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
-        
-        # Configure the retriever for better precision using config
-        retriever = vectorstore.as_retriever(
-            search_type=RETRIEVAL_CONFIG["search_type"],
-            search_kwargs={
-                "k": RETRIEVAL_CONFIG["initial_k"],
-                "lambda_mult": RETRIEVAL_CONFIG["lambda_mult"],
-                "fetch_k": RETRIEVAL_CONFIG["fetch_k"]
-            }
+        # Prefer FastEmbed (ONNX, CPU) for strong local sentence embeddings
+        from langchain_community.embeddings import FastEmbedEmbeddings
+
+        cache_dir = os.path.join(os.getcwd(), ".emb_cache")
+        local_hint = FASTEMBED_CONFIG.get("local_model_dir")
+        offline_only = FASTEMBED_CONFIG.get("offline_only", False)
+
+        # If offline_only, ensure we have a local cache or model dir; else skip FastEmbed
+        have_local = False
+        try:
+            if local_hint and os.path.exists(local_hint):
+                have_local = True
+            elif os.path.isdir(cache_dir):
+                # check for any fastembed model folders inside cache
+                for name in os.listdir(cache_dir):
+                    if "onnx" in name.lower() or "model" in name.lower() or name.startswith("models--"):
+                        have_local = True
+                        break
+        except Exception:
+            have_local = False
+
+        if offline_only and not have_local:
+            raise RuntimeError("FastEmbed offline_only is enabled and no local model/cache is present")
+
+        st.info("🧠 Using FastEmbed embeddings (local, CPU, ONNX)")
+
+        embeddings = FastEmbedEmbeddings(
+            model_name=FASTEMBED_CONFIG["model_name"],
+            cache_dir=(local_hint if local_hint else cache_dir),
+            normalize_embeddings=FASTEMBED_CONFIG.get("normalize", True)
         )
-        
+
+        # Load existing FAISS index if enabled and available
+        if PERSISTENCE_CONFIG.get("persist_faiss") and os.path.isdir(PERSISTENCE_CONFIG.get("path", ".faiss_index")):
+            try:
+                vs = FAISS.load_local(
+                    PERSISTENCE_CONFIG["path"],
+                    embeddings,
+                    allow_dangerous_deserialization=True
+                )
+                # Merge new docs
+                vs.add_documents(text_chunks)
+                return vs
+            except Exception:
+                pass
+
+        vectorstore = FAISS.from_documents(documents=text_chunks, embedding=embeddings)
+        # Persist to disk if requested
+        try:
+            if PERSISTENCE_CONFIG.get("persist_faiss"):
+                vectorstore.save_local(PERSISTENCE_CONFIG.get("path", ".faiss_index"))
+        except Exception:
+            pass
         return vectorstore
         
     except Exception as e:
-        st.error(f"❌ Error with TF-IDF embeddings: {e}")
+        # Be quiet if offline; show a compact note instead of an error wall
+        st.warning(f"⚠️ FastEmbed unavailable locally ({str(e)[:120]}). Falling back to TF‑IDF.")
         
         # If even TF-IDF fails, use a simple fallback
         try:
-            st.warning("🔄 Using basic text matching as fallback...")
-            
-            class SimpleFallbackEmbeddings(Embeddings):
+            st.info("🔄 Falling back to TF-IDF embeddings (torch-free)...")
+
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from langchain.embeddings.base import Embeddings
+            import numpy as np
+
+            class TorchFreeTFIDFEmbeddings(Embeddings):
                 def __init__(self):
-                    self.feature_dim = 300
-                    
+                    self.vectorizer = TfidfVectorizer(
+                        max_features=TFIDF_CONFIG["max_features"],
+                        stop_words=TFIDF_CONFIG["stop_words"],
+                        ngram_range=TFIDF_CONFIG["ngram_range"],
+                        min_df=TFIDF_CONFIG["min_df"],
+                        max_df=TFIDF_CONFIG["max_df"],
+                        sublinear_tf=TFIDF_CONFIG["sublinear_tf"],
+                        analyzer='word'
+                    )
+                    self.fitted = False
+                    self.feature_dim = TFIDF_CONFIG["max_features"]
+
                 def embed_documents(self, texts):
-                    # Very simple hash-based embeddings
-                    embeddings = []
-                    for text in texts:
-                        # Create a simple embedding based on text properties
-                        words = text.lower().split()
-                        embedding = [0.0] * self.feature_dim
-                        
-                        for i, word in enumerate(words[:self.feature_dim]):
-                            embedding[i % self.feature_dim] += hash(word) % 1000 / 1000.0
-                            
-                        embeddings.append(embedding)
-                    return embeddings
-                    
+                    raw = [t.page_content if isinstance(t, Document) else str(t) for t in texts]
+                    if not self.fitted:
+                        vectors = self.vectorizer.fit_transform(raw)
+                        self.fitted = True
+                    else:
+                        vectors = self.vectorizer.transform(raw)
+                    dense = vectors.toarray()
+                    result = []
+                    for v in dense:
+                        if len(v) < self.feature_dim:
+                            padded = np.pad(v, (0, self.feature_dim - len(v)), 'constant')
+                        else:
+                            padded = v[:self.feature_dim]
+                        result.append(padded.tolist())
+                    return result
+
                 def embed_query(self, text):
-                    words = text.lower().split()
-                    embedding = [0.0] * self.feature_dim
-                    
-                    for i, word in enumerate(words[:self.feature_dim]):
-                        embedding[i % self.feature_dim] += hash(word) % 1000 / 1000.0
-                        
-                    return embedding
-            
-            embeddings = SimpleFallbackEmbeddings()
-            vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
-            st.warning("⚠️ Using basic text matching (limited accuracy)")
+                    if not self.fitted:
+                        return [0.0] * self.feature_dim
+                    vector = self.vectorizer.transform([text])
+                    dense = vector.toarray()[0]
+                    if len(dense) < self.feature_dim:
+                        padded = np.pad(dense, (0, self.feature_dim - len(dense)), 'constant')
+                    else:
+                        padded = dense[:self.feature_dim]
+                    return padded.tolist()
+
+            embeddings = TorchFreeTFIDFEmbeddings()
+            vectorstore = FAISS.from_documents(documents=text_chunks, embedding=embeddings)
+            st.warning("⚠️ Using TF-IDF embeddings (limited semantics, good precision)")
             return vectorstore
             
         except Exception as e2:
             st.error(f"❌ All embedding methods failed: {e2}")
             return None
 
-def get_conversation_chain(vectorstore):
-    """Create conversation chain"""
-    # Get available models
-    available_models = get_available_ollama_models()
-    if not available_models:
-        st.error("❌ No Ollama models found. Please install a model first.")
-        st.info("Run: ollama pull llama3.2:1b")
-        return None
-    
-    # Use the first available model
-    model_name = available_models[0]
-    
+def build_hybrid_retriever(vectorstore, raw_docs):
+    """Optionally build a hybrid retriever combining BM25 and vector search.
+
+    raw_docs: list[Document] (original chunked documents)
+    Returns a retriever-like object with get_relevant_documents().
+    """
+    base_retriever = vectorstore.as_retriever(
+        search_type=RETRIEVAL_CONFIG["search_type"],
+        search_kwargs={
+            "k": RETRIEVAL_CONFIG["initial_k"],
+            "lambda_mult": RETRIEVAL_CONFIG["lambda_mult"],
+            "fetch_k": RETRIEVAL_CONFIG["fetch_k"]
+        }
+    )
+
+    if not RETRIEVAL_CONFIG.get("use_hybrid", False):
+        return base_retriever
+
+    try:
+        from rank_bm25 import BM25Okapi
+
+        corpus = [d.page_content for d in raw_docs]
+        tokenized_corpus = [c.split() for c in corpus]
+        bm25 = BM25Okapi(tokenized_corpus)
+
+        class HybridRetriever(BaseRetriever):
+            model_config = ConfigDict(arbitrary_types_allowed=True)
+
+            # Public field so pydantic is aware of it
+            search_kwargs: dict = Field(default_factory=dict)
+
+            # Private attributes (not validated by pydantic)
+            _dense_retriever: Any = PrivateAttr()
+            _bm25: Any = PrivateAttr()
+            _docs: List[Document] = PrivateAttr()
+            _reranker: Any = PrivateAttr(default=None)
+
+            def __init__(self, dense_retriever, bm25, docs):
+                # Initialize BaseModel with declared fields only
+                super().__init__(search_kwargs=dict(getattr(dense_retriever, 'search_kwargs', {})))
+                # Set private attrs
+                self._dense_retriever = dense_retriever
+                self._bm25 = bm25
+                self._docs = docs
+                # optional neural reranker
+                if RERANK_CONFIG.get("use_neural_reranker", False):
+                    try:
+                        from fastembed import Rerank
+                        self._reranker = Rerank(model=RERANK_CONFIG.get("model_name", "BAAI/bge-reranker-small"))
+                    except Exception:
+                        self._reranker = None
+
+            def _doc_key(self, doc: Document) -> str:
+                meta = getattr(doc, 'metadata', {}) or {}
+                return f"{meta.get('source','')}|{meta.get('page','')}|{doc.page_content[:80]}"
+
+            def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> List[Document]:
+                # Dense results
+                dense_docs: List[Document] = self._dense_retriever.get_relevant_documents(query)
+                dense_scores = {self._doc_key(doc): (len(dense_docs) - i) for i, doc in enumerate(dense_docs)}
+
+                # BM25 results
+                scores = self._bm25.get_scores(query.split())
+                bm25_ranked_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+                bm_k = RETRIEVAL_CONFIG.get("bm25_k", 30)
+                bm25_docs: List[Document] = [self._docs[i] for i in bm25_ranked_idx[:bm_k]]
+                bm25_scores = {self._doc_key(doc): scores[i] for i, doc in zip(bm25_ranked_idx[:bm_k], bm25_docs)}
+
+                # Fuse scores per key
+                alpha = RETRIEVAL_CONFIG.get("hybrid_alpha", 0.6)
+                combined = {}
+                for key in set(list(dense_scores.keys()) + list(bm25_scores.keys())):
+                    combined[key] = alpha * dense_scores.get(key, 0.0) + (1 - alpha) * bm25_scores.get(key, 0.0)
+
+                ranked_keys = sorted(combined.keys(), key=lambda k: combined[k], reverse=True)
+                # Map keys back to a document instance (prefer dense, then bm25)
+                by_key = {}
+                for d in dense_docs:
+                    k = self._doc_key(d)
+                    if k not in by_key:
+                        by_key[k] = d
+                for d in bm25_docs:
+                    k = self._doc_key(d)
+                    if k not in by_key:
+                        by_key[k] = d
+
+                # Optional neural reranker on top-N
+                prelim = [by_key[k] for k in ranked_keys if k in by_key]
+                if self._reranker:
+                    top_n = RERANK_CONFIG.get("top_n", 12)
+                    pairs = [(query, d.page_content) for d in prelim[:max(top_n, self.search_kwargs.get("k", 10))]]
+                    try:
+                        reranked = self._reranker.rerank(pairs)
+                        order = [idx for idx, _ in sorted(enumerate(reranked), key=lambda x: -x[1].score)]
+                        prelim = [prelim[i] for i in order]
+                    except Exception:
+                        pass
+
+                k_res = self.search_kwargs.get("k", 10)
+                return prelim[:k_res]
+
+        return HybridRetriever(base_retriever, bm25, raw_docs)
+    except Exception as e:
+        st.warning(f"Hybrid retrieval disabled due to: {e}")
+        return base_retriever
+
+def get_conversation_chain(retriever, model_name):
+    """Create conversation chain from a retriever and selected local model."""
     try:
         llm = OllamaLLM(
             model=model_name,
-            temperature=LLM_CONFIG["temperature"],
+            temperature=0.0,  # deterministic for consistency
             top_p=LLM_CONFIG["top_p"],
             top_k=LLM_CONFIG["top_k"]
         )
-        
-        # Use enhanced prompt template from config
+
         PROMPT = PromptTemplate(
             template=PROMPT_TEMPLATES["main_template"],
             input_variables=["context", "question"]
         )
 
-        # Enhanced retriever configuration using config
-        retriever = vectorstore.as_retriever(
-            search_type=RETRIEVAL_CONFIG["search_type"],
-            search_kwargs={
-                "k": RETRIEVAL_CONFIG["initial_k"],
-                "lambda_mult": RETRIEVAL_CONFIG["lambda_mult"],
-                "fetch_k": RETRIEVAL_CONFIG["fetch_k"]
-            }
-        )
-
-        # Use the updated ConversationalRetrievalChain without deprecated memory
         conversation_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
             retriever=retriever,
             return_source_documents=True,
             combine_docs_chain_kwargs={"prompt": PROMPT}
         )
-
-        st.session_state.model_info = {'model': model_name}
         return conversation_chain
-        
     except Exception as e:
         st.error(f"❌ Error creating conversation chain: {e}")
         return None
@@ -392,8 +521,44 @@ def handle_user_input(user_question):
             st.session_state.chat_history.append(f"Assistant: {response_text}")
             return
         
+        # Helper to update memory after each exchange
+        def update_memory(user_q: str, bot_a: str):
+            try:
+                # Append to chat history as plain strings
+                if 'chat_history' not in st.session_state:
+                    st.session_state.chat_history = []
+                st.session_state.chat_history.append(f"Human: {user_q}")
+                st.session_state.chat_history.append(f"Assistant: {bot_a}")
+
+                # Summarize if too long
+                total_msgs = len(st.session_state.chat_history)
+                if total_msgs > MEMORY_CONFIG.get("summarize_after", 10):
+                    # Build summary prompt
+                    last_k = MEMORY_CONFIG.get("keep_last", 6)
+                    keep = st.session_state.chat_history[-last_k:]
+                    earlier = st.session_state.chat_history[:-last_k]
+                    messages_str = "\n".join(earlier)
+                    prompt = MEMORY_CONFIG.get("summary_prompt", "").format(
+                        current_summary=st.session_state.get('memory_summary', ""),
+                        messages=messages_str
+                    )
+                    # Use current model (Ollama) to summarize locally
+                    model = st.session_state.model_info.get('model') if hasattr(st.session_state, 'model_info') else None
+                    if model and hasattr(st.session_state, 'conversation') and st.session_state.conversation:
+                        # Reuse LLM via combine_docs_chain without docs
+                        try:
+                            llm_only = OllamaLLM(model=model, temperature=0.0, top_p=0.9, top_k=40)
+                            summary = llm_only.invoke(prompt)
+                            st.session_state.memory_summary = summary.strip()
+                            # Keep only last_k recent messages plus summary anchor
+                            st.session_state.chat_history = keep
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         # For document analysis questions, use enhanced retrieval
-        elif intent == "document_analysis":
+        if intent == "document_analysis":
             with st.spinner("🔍 Analyzing documents thoroughly..."):
                 # Enhance the user query for better retrieval
                 enhanced_question = enhance_query(user_question)
@@ -409,57 +574,222 @@ def handle_user_input(user_question):
                         ai_msg = chat_history[i + 1].replace("Assistant: ", "")
                         formatted_history.append((human_msg, ai_msg))
                 
-                # Check if this is a phase counting question
-                is_phase_counting = any(phrase in user_question.lower() for phrase in 
-                    ["how many phases", "combien de phases", "number of phases", "phases are", "phases dans"])
+                # Simple question-type routing
+                ql = user_question.lower()
+                is_phase_counting = any(p in ql for p in ["how many phases", "combien de phases", "number of phases", "phases are", "phases dans"]) or ("how many" in ql and "phase" in ql)
+                is_subject = any(p in ql for p in ["subject", "objet", "what is the subject", "objet du document", "scope", "purpose"])
+                # Detect plural/all-docs variant
+                is_subject_all = is_subject and any(p in ql for p in [
+                    "all documents", "tous les documents", "toutes les documents", "tous les pdf",
+                    "each document", "every document", "pour chaque document", "de tous les documents"
+                ])
+                is_actors = any(p in ql for p in ["actor", "acteurs", "intervenants", "stakeholders", "team", "équipe"])
+                is_critical = (any(p in ql for p in ["most important", "critical", "critique", "étape la plus importante"]) 
+                               and ("phase" in ql or "step" in ql))
                 
-                # Get retriever from conversation chain
-                retriever = st.session_state.conversation.retriever
+                # Get retriever from session state
+                retriever = st.session_state.retriever
                 
                 # For phase counting, use more aggressive retrieval
-                if is_phase_counting:
-                    retriever.search_kwargs["k"] = 15  # Get more documents
-                    retriever.search_kwargs["fetch_k"] = 25  # Consider more candidates
+                if is_phase_counting and hasattr(retriever, 'search_kwargs'):
+                    retriever.search_kwargs["k"] = max(20, RETRIEVAL_CONFIG.get("initial_k", 10))
+                    retriever.search_kwargs["fetch_k"] = max(40, RETRIEVAL_CONFIG.get("fetch_k", 20))
                 
                 # Retrieve documents with enhanced query
                 retrieved_docs = retriever.get_relevant_documents(enhanced_question)
                 
                 # Re-rank documents for better relevance
                 reranked_docs = rerank_retrieved_docs(retrieved_docs, user_question)
+
+                # Confidence gate: estimate evidence score from top docs
+                def estimate_evidence_score(docs):
+                    if not docs:
+                        return 0.0
+                    text = "\n".join(d.page_content.lower() for d in docs[:6])
+                    cues = ["phase 00", "phase 01", "phase 02", "phase 03", "source", "procedure", "processus", "section"]
+                    hits = sum(1 for c in cues if c in text)
+                    density = min(1.0, hits / max(4, len(cues)))
+                    # Light length prior
+                    length = sum(len(d.page_content) for d in docs[:6])
+                    len_factor = 1.0 if length > 2000 else 0.3 if length < 600 else 0.6
+                    return 0.5 * density + 0.5 * len_factor
+
+                evidence_score = estimate_evidence_score(reranked_docs)
                 
                 # Create enhanced context
                 enhanced_context = create_enhanced_context(reranked_docs, user_question)
                 
-                # Use specialized prompt for phase counting
-                if is_phase_counting:
-                    # Create a temporary conversation chain with phase counting prompt
-                    from langchain.prompts import PromptTemplate
-                    phase_prompt = PromptTemplate(
-                        template=PROMPT_TEMPLATES["phase_counting_template"],
-                        input_variables=["context", "question"]
-                    )
-                    
-                    # Enhanced context with emphasis on accuracy
-                    phase_context = f"""INSTRUCTIONS D'ANALYSE PRÉCISE:
-Analysez UNIQUEMENT les phases explicitement mentionnées dans les documents ci-dessous.
-N'ajoutez AUCUNE phase qui n'est pas clairement documentée.
+                # Use specialized handling
+                if is_subject:
+                    # List subjects for all documents if the question implies it
+                    if is_subject_all:
+                        idx = st.session_state.get('subject_index') or {}
+                        if idx:
+                            lines = ["Sujets par document:"]
+                            for src in sorted(idx.keys()):
+                                entry = idx[src]
+                                subj = entry.get('subject')
+                                pg = entry.get('page')
+                                lines.append(f"- {src}: {subj} [source: {src} p.{pg}]")
+                            response = {"answer": "\n".join(lines), "source_documents": reranked_docs[:3]}
+                            # Update memory and skip single-doc subject flow
+                            update_memory(user_question, response['answer'])
+                            if 'source_documents' in response and response['source_documents']:
+                                with st.expander("📚 Sources utilisées"):
+                                    for i, doc in enumerate(response['source_documents'][:3]):
+                                        meta = doc.metadata if hasattr(doc, 'metadata') else {}
+                                        src = meta.get('source', 'unknown')
+                                        page = meta.get('page', '?')
+                                        st.text(f"Source {i+1} — {src} (page {page}):\n{doc.page_content[:400]}...")
+                            return
+                    # Prefer global subject index built at processing time
+                    idx = st.session_state.get('subject_index') or {}
+                    chosen_src = None
+                    chosen = None
+                    if idx:
+                        counts = {}
+                        for d in reranked_docs[:6]:
+                            m = getattr(d, 'metadata', {}) or {}
+                            src = m.get('source')
+                            if src in idx:
+                                counts[src] = counts.get(src, 0) + 1
+                        if counts:
+                            chosen_src = max(counts, key=counts.get)
+                            chosen = idx.get(chosen_src)
+                        else:
+                            # pick any
+                            chosen_src, chosen = next(iter(idx.items())) if idx else (None, None)
+                    if chosen:
+                        ans = f"Sujet: {chosen.get('subject')} [source: {chosen_src} p.{chosen.get('page')}]"
+                        response = {"answer": ans, "source_documents": reranked_docs[:3]}
+                    else:
+                        # fallback: local extraction from retrieved docs
+                        sub = extract_subject_from_docs(reranked_docs)
+                        if sub:
+                            ans = f"Sujet: {sub['subject']} [source: {sub['source']} p.{sub['page']}]"
+                        else:
+                            ans = "Je ne trouve pas le sujet dans les documents fournis."
+                        response = {"answer": ans, "source_documents": reranked_docs[:3]}
 
-{enhanced_context}
+                elif is_actors:
+                    acts = extract_actors_from_docs(reranked_docs)
+                    if acts:
+                        lines = ["Acteurs/intervenants principaux:"]
+                        for i, a in enumerate(acts[:12], 1):
+                            lines.append(f"{i}. {a['name']} [source: {a['source']} p.{a['page']}]")
+                        ans = "\n".join(lines)
+                    else:
+                        ans = "Je ne trouve pas la liste des acteurs dans les documents fournis."
+                    response = {"answer": ans, "source_documents": reranked_docs[:3]}
 
-RAPPEL: Comptez uniquement ce qui existe réellement dans les documents."""
-                    
-                    # Use the conversation chain with specialized prompt and enhanced context
-                    response = st.session_state.conversation.combine_docs_chain.run(
-                        input_documents=reranked_docs[:8], 
-                        question=f"CONSIGNE STRICTE: Basez-vous UNIQUEMENT sur les documents fournis. Ne mentionnez que les phases qui existent vraiment. Question: {user_question}"
-                    )
-                    response = {"answer": response, "source_documents": reranked_docs[:5]}
+                elif is_critical:
+                    # If docs do not define a single critical phase, state that clearly
+                    phase_map = extract_phases_from_docs(reranked_docs)
+                    if not phase_map:
+                        ans = "Les documents ne définissent pas d'étape critique unique."
+                    else:
+                        ans = ("Les documents ne définissent pas explicitement une phase 'critique'. "
+                               "La production/validation (Phases 02–03) apparaissent comme sensibles selon le contexte, "
+                               "mais aucune mention formelle n'établit une 'phase la plus importante'.")
+                    response = {"answer": ans, "source_documents": reranked_docs[:4]}
+
+                elif is_phase_counting:
+                    # Create a temporary conversation chain with phase counting prompt (kept for reference)
+                    # First, extract phases deterministically from the whole corpus
+                    phase_map = build_global_phase_map()
+                    # If empty (unlikely), fall back to retrieved docs
+                    if not phase_map:
+                        phase_map = extract_phases_from_docs(reranked_docs)
+                    # If likely incomplete (e.g., missing 03 while 01/02 exist), expand search once
+                    if 1 in phase_map and 2 in phase_map and 3 not in phase_map:
+                        more_docs = retriever.get_relevant_documents(enhanced_question + " phase 03 production série")
+                        more_docs = rerank_retrieved_docs(more_docs, user_question)
+                        merge_map = extract_phases_from_docs(more_docs)
+                        for k, v in merge_map.items():
+                            if k not in phase_map or (v.get("name") and len(v.get("name","")) > len(phase_map[k].get("name",""))):
+                                phase_map[k] = v
+
+                    # Build a crisp, grounded answer from the extracted phases
+                    if phase_map:
+                        sorted_nums = sorted(phase_map.keys())
+                        lines = [f"Il y a {len(sorted_nums)} phases principales dans ce projet :"]
+                        for i, n in enumerate(sorted_nums, 1):
+                            name = phase_map[n].get("name") or ""
+                            # Preferred citation from extractor map
+                            cite = ""
+                            cites = phase_map[n].get('citations', [])
+                            if cites:
+                                c0 = cites[0]
+                                cite = f" [source: {c0.get('source','doc')} p.{c0.get('page','?')}]"
+                            if not cite:
+                                # Derive a short citation from retrieved docs as fallback
+                                for d in reranked_docs:
+                                    if f"phase {n:02d}" in d.page_content.lower() or f"phase {n}" in d.page_content.lower():
+                                        m = getattr(d, 'metadata', {}) or {}
+                                        src = m.get('source', 'doc')
+                                        page = m.get('page', '?')
+                                        cite = f" [source: {src} p.{page}]"
+                                        break
+                            if name:
+                                lines.append(f"{i}.  Phase {n:02d} : {name}{cite}")
+                            else:
+                                lines.append(f"{i}.  Phase {n:02d}{cite}")
+                        response = {"answer": "\n".join(lines), "source_documents": reranked_docs[:5]}
+                    else:
+                        # Fall back to LLM generation with strict instruction
+                        response_txt = st.session_state.conversation.combine_docs_chain.run(
+                            input_documents=reranked_docs[:8], 
+                            question=f"CONSIGNE STRICTE: Basez-vous UNIQUEMENT sur les documents fournis. Ne mentionnez que les phases qui existent vraiment. Question: {user_question}"
+                        )
+                        response = {"answer": response_txt, "source_documents": reranked_docs[:5]}
                 else:
-                    # Use the regular conversation chain
-                    response = st.session_state.conversation.invoke({
-                        'question': user_question,
-                        'chat_history': formatted_history
-                    })
+                    # Include memory summary and last turns in the question to improve continuity
+                    memory_header = ""
+                    if st.session_state.get('memory_summary'):
+                        memory_header += f"Contexte de la conversation (résumé): {st.session_state.memory_summary}\n"
+                    # Also include last few turns verbatim
+                    tail = st.session_state.chat_history[-MEMORY_CONFIG.get('keep_last', 6):]
+                    if tail:
+                        memory_header += "Derniers échanges:\n" + "\n".join(tail) + "\n"
+
+                    # Light language mirroring hint (prefix instruction)
+                    def _detect_lang(txt: str) -> str:
+                        fr_hits = sum(1 for w in [" le ", " la ", " les ", " des ", " de ", " et ", " phase ", " combien ", " projet "] if w in (" " + txt.lower() + " "))
+                        en_hits = sum(1 for w in [" the ", " and ", " phase ", " how many ", " project "] if w in (" " + txt.lower() + " "))
+                        return "fr" if fr_hits >= en_hits else "en"
+
+                    if st.session_state.get('mirror_lang', True):
+                        _lang = _detect_lang(user_question)
+                        if _lang == "en":
+                            memory_header = "Please answer in English.\n" + memory_header
+                        else:
+                            memory_header = "Réponds en français.\n" + memory_header
+
+                    # Confidence/"no-answer" behavior
+                    if GUARDRAIL_CONFIG.get("enable_confidence_gate", True):
+                        min_docs = GUARDRAIL_CONFIG.get("min_docs", 2)
+                        min_score = GUARDRAIL_CONFIG.get("min_evidence_score", 0.35)
+                        if len(reranked_docs) < min_docs or evidence_score < min_score:
+                            # Provide helpful fallback with top snippets
+                            preview = []
+                            for d in reranked_docs[:3]:
+                                m = getattr(d, 'metadata', {}) or {}
+                                src = m.get('source', 'doc')
+                                page = m.get('page', '?')
+                                snippet = d.page_content.strip().replace("\n", " ")[:280]
+                                preview.append(f"- {src} p.{page}: {snippet}...")
+                            msg = "Je ne trouve pas de réponse sûre dans les documents fournis. Voici les passages les plus proches:\n" + "\n".join(preview)
+                            response = {"answer": msg, "source_documents": reranked_docs[:3]}
+                        else:
+                            response = st.session_state.conversation.invoke({
+                                'question': memory_header + user_question,
+                                'chat_history': formatted_history
+                            })
+                    else:
+                        response = st.session_state.conversation.invoke({
+                            'question': memory_header + user_question,
+                            'chat_history': formatted_history
+                        })
                 
                 # Validate response completeness (this will catch missing Phase 00)
                 is_complete, warning_msg = validate_response_completeness(response['answer'], user_question)
@@ -484,23 +814,21 @@ RAPPEL: Comptez uniquement ce qui existe réellement dans les documents."""
                         response = enhanced_response
                 
                 # Reset retriever parameters to normal
-                if is_phase_counting:
+                if is_phase_counting and hasattr(retriever, 'search_kwargs'):
                     retriever.search_kwargs["k"] = RETRIEVAL_CONFIG["initial_k"]
                     retriever.search_kwargs["fetch_k"] = RETRIEVAL_CONFIG["fetch_k"]
                 
-                # Update chat history manually
-                if 'chat_history' not in st.session_state:
-                    st.session_state.chat_history = []
-                
-                # Add question and answer to history
-                st.session_state.chat_history.append(f"Human: {user_question}")
-                st.session_state.chat_history.append(f"Assistant: {response['answer']}")
+                # Update memory and chat history
+                update_memory(user_question, response['answer'])
                 
                 # Show source documents for transparency
                 if 'source_documents' in response and response['source_documents']:
                     with st.expander("📚 Sources utilisées"):
                         for i, doc in enumerate(response['source_documents'][:3]):
-                            st.text(f"Source {i+1}: {doc.page_content[:200]}...")
+                            meta = doc.metadata if hasattr(doc, 'metadata') else {}
+                            src = meta.get('source', 'unknown')
+                            page = meta.get('page', '?')
+                            st.text(f"Source {i+1} — {src} (page {page}):\n{doc.page_content[:400]}...")
                             
     except Exception as e:
         st.error(f"❌ Error: {str(e)}")
@@ -515,20 +843,11 @@ RAPPEL: Comptez uniquement ce qui existe réellement dans les documents."""
                     'chat_history': []
                 })
                 
-                if 'chat_history' not in st.session_state:
-                    st.session_state.chat_history = []
-                
-                st.session_state.chat_history.append(f"Human: {user_question}")
-                st.session_state.chat_history.append(f"Assistant: {simple_response['answer']}")
+                update_memory(user_question, simple_response['answer'])
             else:
                 # If no conversation chain, provide a helpful message
                 fallback_msg = "Je suis désolé, mais je n'ai pas encore de documents à analyser. Veuillez d'abord uploader et traiter vos documents PDF."
-                
-                if 'chat_history' not in st.session_state:
-                    st.session_state.chat_history = []
-                
-                st.session_state.chat_history.append(f"Human: {user_question}")
-                st.session_state.chat_history.append(f"Assistant: {fallback_msg}")
+                update_memory(user_question, fallback_msg)
             
         except Exception as e2:
             st.error(f"❌ Fallback also failed: {str(e2)}")
@@ -536,11 +855,7 @@ RAPPEL: Comptez uniquement ce qui existe réellement dans les documents."""
 def main():
     load_dotenv()
 
-    st.set_page_config(
-        page_title="PDF Chat",
-        page_icon="💬",
-        layout="wide"
-    )
+    st.set_page_config(page_title="PDF Chat", page_icon="💬", layout="wide")
     
     st.write(css, unsafe_allow_html=True)
 
@@ -549,15 +864,17 @@ def main():
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+    if "memory_summary" not in st.session_state:
+        st.session_state.memory_summary = ""
 
     # Simple header
-    st.title("💬 PDF Chat")
+    st.title("PDF Chat")
     
     # Check Ollama installation
     if not check_ollama_installation():
-        st.error("❌ Ollama not detected. Please install Ollama first.")
+        st.error("Ollama not detected. Please install Ollama first.")
         st.info("Download from: https://ollama.ai")
-        if st.button("🔄 Check Again"):
+        if st.button("Check Again"):
             st.rerun()
         st.stop()
     
@@ -572,7 +889,7 @@ def main():
                 label_visibility="collapsed"
             )
         with col2:
-            submit_button = st.form_submit_button("💬 Send", use_container_width=True)
+            submit_button = st.form_submit_button("Send", use_container_width=True)
     
     # Handle user input
     if submit_button and user_question:
@@ -580,60 +897,107 @@ def main():
             handle_user_input(user_question)
             st.rerun()
         else:
-            st.warning("📁 Please upload and process documents first!")
+            st.warning("Please upload and process documents first.")
     
     # **SIMPLE SIDEBAR FOR DOCUMENTS**
     with st.sidebar:
-        st.header("📄 Documents")
-        
+        st.header("Documents")
+        # Memory controls
+        st.subheader("Session memory")
+        if st.button("Reset memory", use_container_width=True):
+            st.session_state.memory_summary = ""
+            st.session_state.chat_history = []
+            st.success("Memory cleared")
+
         pdf_docs = st.file_uploader(
             "Upload PDF files",
             accept_multiple_files=True,
             type="pdf",
             label_visibility="collapsed"
         )
-        
-        if st.button("🔄 Process", use_container_width=True):
+
+        # Model selection UI
+        st.subheader("Local model")
+        available = get_available_ollama_models()
+        preferred = LLM_CONFIG.get("preferred_models", [])
+        # Choose first installed preferred model; fall back to any available
+        selected_model = None
+        for m in preferred:
+            if m in available:
+                selected_model = m
+                break
+        if not selected_model and available:
+            selected_model = available[0]
+        model_choice = st.selectbox("Select Ollama model", options=available, index=(available.index(selected_model) if selected_model in available else 0)) if available else None
+
+        # Language mirroring toggle
+        st.subheader("Language")
+        st.checkbox("Mirror user's language", value=True, key="mirror_lang")
+
+        if st.button("Process", use_container_width=True):
             if not pdf_docs:
-                st.warning("⚠️ Upload PDFs first")
+                st.warning("Upload PDFs first")
             else:
                 with st.spinner("Processing..."):
                     try:
-                        # Extract text
-                        raw_text = get_pdf_text(pdf_docs)
+                        # Extract docs
+                        docs = get_pdf_text(pdf_docs)
                         
-                        if not raw_text.strip():
-                            st.error("❌ No text found")
+                        if not docs:
+                            st.error("No text found")
                         else:
-                            # Create chunks
-                            text_chunks = get_text_chunks(raw_text)
+                            # Create chunks preserving metadata
+                            text_chunks = get_text_chunks(docs)
+                            # Keep a copy for deterministic full-corpus scans
+                            st.session_state.all_chunks = text_chunks
+                            # Build subject index (once per processing)
+                            try:
+                                st.session_state.subject_index = build_subject_index(text_chunks, st.session_state.get('pdf_meta', {}))
+                            except Exception:
+                                st.session_state.subject_index = {}
                             
                             # Create vector store
                             vectorstore = get_vectorstore(text_chunks)
                             if not vectorstore:
-                                st.error("❌ Processing failed")
+                                st.error("Processing failed")
                                 return
 
+                            # Build hybrid retriever
+                            retriever = build_hybrid_retriever(vectorstore, text_chunks)
+
                             # Create conversation chain
-                            conversation_chain = get_conversation_chain(vectorstore)
+                            if not model_choice:
+                                st.error("No Ollama models available. Install one with: ollama pull llama3.1:8b")
+                                return
+                            conversation_chain = get_conversation_chain(retriever, model_choice)
                             
                             if conversation_chain:
                                 st.session_state.conversation = conversation_chain
-                                st.success("✅ Ready!")
+                                st.session_state.retriever = retriever
+                                st.session_state.model_info = {'model': model_choice}
+                                # Reset caches
+                                st.session_state.phase_cache = None
+                                # Save FAISS after building retriever (best-effort)
+                                try:
+                                    if PERSISTENCE_CONFIG.get("persist_faiss"):
+                                        vectorstore.save_local(PERSISTENCE_CONFIG.get("path", ".faiss_index"))
+                                except Exception:
+                                    pass
+                                st.success("Ready.")
                             else:
-                                st.error("❌ Setup failed")
+                                st.error("Setup failed")
                                 
                     except Exception as e:
-                        st.error(f"❌ Error: {str(e)[:50]}...")
+                        st.error(f"Error: {str(e)[:50]}...")
         
-        # Show status
-        if st.session_state.conversation:
-            st.success("✅ AI Ready")
-            if hasattr(st.session_state, 'model_info'):
-                model = st.session_state.model_info.get('model', 'AI')
-                st.caption(f"Model: {model}")
-        else:
-            st.info("📁 Upload documents to start")
+    # Show status (outside sidebar)
+    if st.session_state.conversation:
+        st.success("AI Ready")
+        if hasattr(st.session_state, 'model_info'):
+            model = st.session_state.model_info.get('model', 'AI')
+            st.caption(f"Model: {model}")
+    else:
+        st.info("Upload documents to start")
     
     # **CHAT AREA - MAIN CONTENT**
     st.markdown("---")
@@ -649,7 +1013,7 @@ def main():
                 bot_msg = message.replace("Assistant: ", "")
                 st.write(bot_template.replace("{{MSG}}", bot_msg), unsafe_allow_html=True)
     else:
-        st.info("💬 Start a conversation by typing a question above")
+        st.info("Start a conversation by typing a question above")
 
 if __name__ == '__main__':
     main()

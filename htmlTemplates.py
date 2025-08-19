@@ -1,49 +1,41 @@
 css = '''
 <style>
+/* Minimal, clean layout */
 .chat-message {
-    padding: 1rem; 
-    border-radius: 10px; 
-    margin-bottom: 1rem; 
     display: flex;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    gap: 12px;
+    padding: 12px 14px;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background: #ffffff;
+    margin: 8px 0;
 }
-.chat-message.user {
-    background: linear-gradient(135deg, #4287f5 0%, #2563eb 100%);
-}
-.chat-message.bot {
-    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-}
-.chat-message .avatar {
-    width: 15%;
-    min-width: 50px;
-}
+.chat-message.user { border-left: 3px solid #3b82f6; }
+.chat-message.bot  { border-left: 3px solid #10b981; }
+
+.chat-message .avatar { width: 36px; height: 36px; }
 .chat-message .avatar img {
-    width: 45px;
-    height: 45px;
+    width: 36px;
+    height: 36px;
     border-radius: 50%;
     object-fit: cover;
-    border: 2px solid rgba(255,255,255,0.3);
 }
+
 .chat-message .message {
-    width: 85%;
-    padding: 0 1rem;
-    color: #fff;
-    font-size: 14px;
-    line-height: 1.5;
+    flex: 1;
+    color: #111827;
+    font: 400 14px/1.55 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    white-space: pre-wrap;
 }
-.stForm {
-    background-color: #f8f9fa;
-    padding: 1rem;
-    border-radius: 10px;
-    border: 1px solid #e9ecef;
-}
+
+.stForm { border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; background: #fff; }
 </style>
 '''
 
 bot_template = '''
 <div class="chat-message bot">
     <div class="avatar">
-        <img src="https://i.ibb.co/cN0nmSj/Screenshot-2023-05-28-at-02-37-21.png">
+        <img src="https://i.ibb.co/cN0nmSj/Screenshot-2023-05-28-at-02-37-21.png" alt="bot">
     </div>
     <div class="message">{{MSG}}</div>
 </div>
@@ -52,8 +44,8 @@ bot_template = '''
 user_template = '''
 <div class="chat-message user">
     <div class="avatar">
-        <img src="https://cdn-icons-png.flaticon.com/512/4042/4042171.png">
-    </div>    
+        <img src="https://cdn-icons-png.flaticon.com/512/4042/4042171.png" alt="user">
+    </div>
     <div class="message">{{MSG}}</div>
 </div>
 '''

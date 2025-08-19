@@ -2,25 +2,30 @@
 
 import re
 
+_DOC_KEYWORDS = ['phase', 'processus', 'projet', 'document', 'étape', 'développement', 'phases', 'documents']
+
 def detect_intent(user_input):
     """Detect user intent to provide appropriate responses"""
     
     user_input_lower = user_input.lower().strip()
+    # Normalize punctuation/spaces so patterns like "hi, how are you" are caught
+    norm = re.sub(r"[\.,!?:;]+", " ", user_input_lower)
+    norm = re.sub(r"\s+", " ", norm).strip()
     
     # Simple greeting patterns
     greeting_patterns = [
-        r'^(hello|hi|hey|bonjour|salut)$',
-        r'^(how are you|comment allez-vous)$',
-        r'^(good morning|good afternoon|good evening|bonsoir|bonne journée)$',
-        r'^(merci|thank you|thanks)$',
-        r'^(au revoir|goodbye|bye)$'
+        r'^(hello|hi|hey|bonjour|salut)(\s.*)?$',
+        r'^(how are you|comment allez[- ]vous|ça va|comment ça va)(\s.*)?$',
+        r'^(good (morning|afternoon|evening)|bonsoir|bonne journée)(\s.*)?$',
+        r'^(merci|thank you|thanks)(\s.*)?$',
+        r'^(au revoir|goodbye|bye)(\s.*)?$'
     ]
     
     # Simple chat patterns (not greetings but basic conversation)
     simple_chat_patterns = [
-        r'^(ça va|comment ça va|how are you doing)$',
-        r'^(quoi de neuf|what\'s up|quoi de nouveau)$',
-        r'^(comment vas-tu|how do you do)$'
+        r'^(ça va|comment ça va|how are you doing)(\s.*)?$',
+        r'^(quoi de neuf|what\'s up|quoi de nouveau)(\s.*)?$',
+        r'^(comment vas-tu|how do you do)(\s.*)?$'
     ]
     
     # Document analysis patterns
@@ -31,27 +36,43 @@ def detect_intent(user_input):
         r'\b(décris|describe|explique|explain)\b'
     ]
     
-    # Check for greetings
+    # If message has greeting and no document keywords, treat as greeting
+    if not any(k in norm for k in _DOC_KEYWORDS):
+        for pattern in greeting_patterns:
+            if re.search(pattern, norm):
+                return "greeting"
+        for pattern in simple_chat_patterns:
+            if re.search(pattern, norm):
+                return "simple_chat"
+
+    # Check for greetings (fallback even if mixed)
     for pattern in greeting_patterns:
-        if re.search(pattern, user_input_lower):
+        if re.search(pattern, norm):
             return "greeting"
     
     # Check for simple chat
     for pattern in simple_chat_patterns:
-        if re.search(pattern, user_input_lower):
+        if re.search(pattern, norm):
             return "simple_chat"
     
     # Check for document analysis requests
     for pattern in document_patterns:
-        if re.search(pattern, user_input_lower):
+        if re.search(pattern, norm):
             return "document_analysis"
     
     # If input is very short and doesn't contain document keywords
-    if len(user_input.split()) <= 3 and not any(keyword in user_input_lower for keyword in 
-        ['phase', 'processus', 'projet', 'document', 'étape', 'développement']):
+    if len(norm.split()) <= 3 and not any(keyword in norm for keyword in _DOC_KEYWORDS):
         return "simple_chat"
     
     # Default to document analysis for longer queries
+    # Prefer simple chat if the sentence is composed mostly of greeting words
+    greeting_vocab = set(['hello','hi','hey','bonjour','salut','merci','thank','thanks','bye','goodbye','au','revoir','how','are','you','ça','va','comment','allez','vous','morning','afternoon','evening'])
+    tokens = norm.split()
+    if tokens:
+        frac_greet = sum(1 for t in tokens if t in greeting_vocab) / len(tokens)
+        if frac_greet >= 0.6 and not any(k in norm for k in _DOC_KEYWORDS):
+            return "simple_chat"
+
     return "document_analysis"
 
 def generate_greeting_response():

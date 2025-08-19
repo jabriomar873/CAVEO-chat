@@ -1,6 +1,7 @@
 # Virtual Environment
 venv/
 env/
+.venv/
 .env
 
 # Python Cache
@@ -32,3 +33,9 @@ Thumbs.db
 # Temporary Files
 *.tmp
 *.temp
+
+# Embedding/Model caches
+.emb_cache/
+.locks/
+models--*/
+.faiss_index/

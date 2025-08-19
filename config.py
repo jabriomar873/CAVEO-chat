@@ -15,7 +15,12 @@ RETRIEVAL_CONFIG = {
     "extended_k": 15,
     
     # Search type: "similarity", "mmr", or "similarity_score_threshold"
-    "search_type": "mmr"
+    "search_type": "mmr",
+
+    # Hybrid retrieval: combine lexical (BM25) + vector search
+    "use_hybrid": True,
+    "bm25_k": 30,
+    "hybrid_alpha": 0.6  # Weight for dense score in hybrid fusion (0..1)
 }
 
 # Text Processing Configuration
@@ -51,6 +56,59 @@ TFIDF_CONFIG = {
     "stop_words": "english"
 }
 
+# FastEmbed Embeddings (local, CPU, ONNX)
+FASTEMBED_CONFIG = {
+    # Supported models: "sentence-transformers/all-MiniLM-L6-v2" or lightweight fastembed defaults
+    "model_name": "BAAI/bge-small-en-v1.5",  # good quality, small
+    "batch_size": 64,
+    "normalize": True,
+    # Offline behavior. If True, we will not attempt any network downloads.
+    # Provide a local model directory if you have pre-fetched FastEmbed models.
+    "offline_only": True,
+    # Optional local model directory (acts as cache path or direct model path if supported)
+    # Example expected content: an ONNX model folder such as
+    # models--qdrant--bge-small-en-v1.5-onnx-q or a direct model path.
+    "local_model_dir": None
+}
+
+# Neural re-ranking (local, ONNX via fastembed)
+RERANK_CONFIG = {
+    "use_neural_reranker": True,
+    "model_name": "BAAI/bge-reranker-small",
+    "top_n": 12
+}
+
+# Confidence/"no-answer" guardrails
+GUARDRAIL_CONFIG = {
+    # Enable confidence gate to avoid hallucinations when evidence is weak
+    "enable_confidence_gate": True,
+    # Minimum evidence score (0..1) required to answer directly
+    "min_evidence_score": 0.35,
+    # Minimum number of decent matches before answering
+    "min_docs": 2
+}
+
+# Vector store persistence (local-only)
+PERSISTENCE_CONFIG = {
+    "persist_faiss": True,
+    # Directory to save FAISS + docstore on disk
+    "path": ".faiss_index"
+}
+
+# Conversation Memory
+MEMORY_CONFIG = {
+    "summarize_after": 10,   # summarize when messages exceed this count
+    "keep_last": 6,          # keep last N messages verbatim alongside summary
+    "summary_prompt": (
+        "Tu es un assistant. Résume brièvement l'échange ci-dessous en 5-8 puces max, "
+        "en conservant les faits clés (phases, nombres, décisions). "
+        "Évite les généralités et ne rajoute aucune information non présente.\n\n"
+        "Résumé actuel (si présent):\n{current_summary}\n\n"
+        "Nouveaux messages (du plus ancien au plus récent):\n{messages}\n\n"
+        "Résumé mis à jour:" 
+    )
+}
+
 # LLM Configuration
 LLM_CONFIG = {
     # Temperature for response generation
@@ -60,7 +118,16 @@ LLM_CONFIG = {
     "top_p": 0.9,
     
     # Top-k for top-k sampling
-    "top_k": 40
+    "top_k": 40,
+    # Preferred local models to try (order matters). Must be available in Ollama.
+    # We'll pick the first installed one.
+    "preferred_models": [
+        "llama3.1:8b-instruct-q4_K_M",
+        "llama3.2:3b",
+        "phi3:3.8b",
+        "qwen2.5:7b-instruct-q4_K_M",
+        "mistral:7b-instruct-q4_K_M"
+    ]
 }
 
 # Query Enhancement Keywords
@@ -90,13 +157,14 @@ VALIDATION_CONFIG = {
 
 # Prompt Templates
 PROMPT_TEMPLATES = {
-    "main_template": """Tu es un assistant expert en analyse de documents techniques. Tu dois répondre aux questions en te basant sur les documents fournis.
+    "main_template": """Tu es un assistant expert en analyse de documents techniques. Tu dois répondre aux questions en te basant STRICTEMENT sur les documents fournis.
 
 INSTRUCTIONS:
 1. Si la question porte sur des éléments spécifiques des documents (phases, processus, etc.), analyse le contenu en détail
 2. Si c'est une question générale, donne une réponse appropriée et propose d'analyser les documents si nécessaire
-3. Sois précis et utilise les informations exactes des documents
-4. Si des informations semblent manquer, indique-le clairement
+3. Sois précis et utilise les informations exactes des documents; ne fabrique rien
+4. Si des informations semblent manquer, indique-le clairement et dis "Je ne trouve pas dans les documents fournis"
+5. Lorsque tu affirmes un fait, ajoute une courte citation entre crochets: [source: <fichier> p.<page>]
 
 CONTEXTE DES DOCUMENTS:
 {context}

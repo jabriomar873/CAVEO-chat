@@ -19,6 +19,9 @@ langchain-ollama>=0.3.0
 # Torch-free Embeddings & Vector Store
 scikit-learn>=1.4.0  # For TF-IDF embeddings
 faiss-cpu>=1.8.0
+fastembed>=0.3.3  # Fast local sentence embeddings (ONNX, CPU-friendly)
+rank-bm25>=0.2.2  # Lexical retrieval for hybrid search
+onnxruntime>=1.17.0  # Ensures fastembed runs locally on CPU
 
 # Environment
 python-dotenv>=1.0.0
